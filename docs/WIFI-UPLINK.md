@@ -85,6 +85,25 @@ the agent. It never writes UCI, init.d, stock firewall chains or main routes.
    DHCP client that exited, and rebuilds everything when the interface vanished with a
    firmware Wi-Fi reload. At start it removes a previous agent's online rules and
    processes for `ou-sta0`, and puts traffic back on Wi-Fi only after its own checks.
+9. **Hotspot reconfiguration.** A changed hotspot save pauses the relay at runtime
+   without changing its saved enabled state or profiles. The supervisor stops its
+   processes and client interface before acknowledging the pause. The save then
+   reloads Wi-Fi and waits for a reload transition, stock-service idle state, and
+   two consistent observations of the intended AP names and primary frequencies.
+   Hostapd and the driver must agree. Failed application uses the existing UCI
+   rollback while the relay stays paused; releasing the pause resumes the current
+   saved relay intent. An unchanged save leaves the connection alone.
+10. **Channel-switch stall.** On affected firmware, a stalled channel switch can
+    prevent encryption-key installation and reject joins on both hotspot bands.
+    The supervisor ignores historical kernel errors and normal ACS/DFS settling.
+    A primary-frequency mismatch that persists for at least 15 seconds, accompanied
+    by a new `wait for csa event failed` event, permits one recovery: disable all
+    intended active APs before enabling any, then verify readiness and unchanged
+    saved/generated configuration. Disabled APs stay disabled. A failed recovery
+    or recurrence stops automatic attempts and reports a reason; it cannot enter a
+    restart loop. A coordinated settings change establishes a new monitoring
+    baseline and allowance. The monitor does not rewrite channel width, passwords,
+    SSIDs, firmware or boot services.
 
 ## API
 
@@ -119,6 +138,10 @@ it holds the passwords).
 - One radio serves both the hotspot and the uplink. Joining a network on another
   channel of the same band can move the hotspot to that channel, and its devices
   reconnect.
+- Hotspot saves can briefly disconnect clients while the relay is held and Wi-Fi
+  reloads. The dashboard waits up to three minutes for verification or rollback.
+  The radio checks prove controller/driver agreement, not successful client
+  authentication; verify joining and browsing from a client after recovery.
 - Web login: a device that Clash routes may send the login page to a node, which the
   portal blocks until the login; turn the proxy off while signing in. Portals that
   charge per device see one device. Portals that only hijack DNS (no HTTP redirect for

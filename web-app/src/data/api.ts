@@ -691,7 +691,8 @@ export const api = {
 
   // WiFi
   wifiStatus: () => get('/api/wifi/status').then(mapWifi),
-  wifiSet: (body: Record<string, unknown>) => put('/api/wifi/settings', body),
+  // The agent waits for relay teardown, radio readiness and rollback if needed.
+  wifiSet: (body: Record<string, unknown>) => req('PUT', '/api/wifi/settings', body, undefined, 180_000),
   // Wi-Fi relay: saves answer at once and the agent applies them in the background; a scan
   // with the client running waits for its results (~5 s), else sweeps from the hotspot.
   uplink: () => get('/api/wifi/uplink').then(d => d as unknown as UplinkStatus),

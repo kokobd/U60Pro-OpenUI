@@ -7,7 +7,7 @@
 //! routes, stock firewall chains, init.d and UCI are never changed, so a reboot without
 //! the agent leaves nothing behind. The hotspot keeps running; the radio may move it to
 //! the upstream channel.
-use crate::{egress, storage};
+use crate::{egress, storage, uci_transaction, wifi_maintenance, wifi_radio};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -20,7 +20,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Condvar, Mutex,
+        Condvar, Mutex, TryLockError,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -802,6 +802,18 @@ fn parse_iw_scan(text: &str) -> Vec<Seen> {
 /// Nearby networks. Uses the running supplicant when there is one, otherwise an
 /// off-channel scan on a hotspot interface, which keeps the hotspot up.
 pub fn scan() -> (u16, Value) {
+    // A scan must not race a firmware reload or AP recovery. The supervisor uses
+    // try_lock so a settings handler can hold this lock while awaiting teardown.
+    let _guard = match uci_transaction::WIFI_CHANGE.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            return (
+                503,
+                json!({"ok": false, "error": "Wi-Fi is busy with another operation; wait and retry"}),
+            );
+        }
+    };
     let result = (|| -> Result<Vec<Seen>, String> {
         if wpa("PING", Duration::from_secs(1)).is_ok_and(|r| r.starts_with("PONG")) {
             let _ = wpa("SCAN", Duration::from_secs(2));
@@ -1902,8 +1914,18 @@ fn wake() {
     WAKE.1.notify_all();
 }
 
+/// Saved relay intent is unchanged. The acknowledgement comes from the worker
+/// after its processes and managed interface have actually stopped.
+pub fn hold_for_hotspot_change() -> Result<wifi_maintenance::Hold<'static>, String> {
+    let mut hold = wifi_maintenance::begin(wake)?;
+    hold.wait(Duration::from_secs(35))?;
+    Ok(hold)
+}
+
 pub fn start() {
     std::thread::spawn(|| {
+        let mut radio_monitor = wifi_radio::Monitor::default();
+        radio_monitor.baseline();
         kill_stale();
         // A previous agent's rules would keep all traffic on an uplink nobody checks;
         // this run puts them back once its own checks pass.
@@ -1924,25 +1946,74 @@ pub fn start() {
             paused: None,
         };
         let mut first = true;
+        let mut held_ticket = None;
+        let mut last_radio_error = None;
         loop {
-            match load() {
-                Ok(s) => {
-                    if first && !s.enabled {
-                        // A previous agent may have left the interface and rules.
-                        teardown(&mut rt);
-                    }
-                    if let Err(e) = step(&mut rt, &s) {
-                        go_offline(&mut rt);
-                        rt.view.state = State::Unavailable;
-                        rt.view.reason = Some(e);
-                    }
+            if let Some(ticket) = wifi_maintenance::pending() {
+                if held_ticket != Some(ticket) {
+                    teardown(&mut rt);
+                    let stopped = !iface_exists() && rt.supplicant.is_none() && rt.dhcp.is_none();
+                    radio_monitor = wifi_radio::Monitor::default();
+                    radio_monitor.baseline();
+                    last_radio_error = None;
+                    wifi_maintenance::acknowledge(
+                        ticket,
+                        if stopped {
+                            Ok(())
+                        } else {
+                            Err(
+                                "The Wi-Fi relay did not stop; hotspot settings were not applied"
+                                    .into(),
+                            )
+                        },
+                    );
+                    held_ticket = Some(ticket);
+                    first = false;
                 }
-                Err(e) => {
-                    rt.view.state = State::Unavailable;
-                    rt.view.reason = Some(e);
+                rt.view.state = State::Unavailable;
+                rt.view.reason =
+                    Some("Applying hotspot settings; Wi-Fi relay is temporarily paused".into());
+            } else {
+                held_ticket = None;
+                // Never block here: the settings handler may own WIFI_CHANGE
+                // while waiting for the teardown acknowledgement above.
+                let operation = match uci_transaction::WIFI_CHANGE.try_lock() {
+                    Ok(guard) => Some(guard),
+                    Err(TryLockError::Poisoned(error)) => Some(error.into_inner()),
+                    Err(TryLockError::WouldBlock) => None,
+                };
+                if let Some(_operation) = operation {
+                    match load() {
+                        Ok(s) => {
+                            if first && !s.enabled {
+                                // A previous agent may have left the interface and rules.
+                                teardown(&mut rt);
+                            }
+                            if let Err(e) = step(&mut rt, &s) {
+                                go_offline(&mut rt);
+                                rt.view.state = State::Unavailable;
+                                rt.view.reason = Some(e);
+                            }
+                        }
+                        Err(e) => {
+                            rt.view.state = State::Unavailable;
+                            rt.view.reason = Some(e);
+                        }
+                    }
+                    first = false;
+                    match radio_monitor.check() {
+                        Ok(Some(message)) => log_line(&message),
+                        Ok(None) => {}
+                        Err(error) => {
+                            if last_radio_error.as_ref() != Some(&error) {
+                                log_line(&error);
+                                last_radio_error = Some(error.clone());
+                            }
+                            rt.view.reason = Some(error);
+                        }
+                    }
                 }
             }
-            first = false;
             publish(&rt.view);
             let (lock, cvar) = &WAKE;
             let woken = lock.lock().unwrap_or_else(|e| e.into_inner());

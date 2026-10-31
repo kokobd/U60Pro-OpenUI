@@ -7,7 +7,6 @@ use serde_json::{json, Value};
 use crate::handlers::AppState;
 use crate::ubus;
 use crate::uci_transaction::{self, Change};
-use crate::util::MutexExt;
 
 const WIFI_ONOFF_KEY: &str = "wifi_onoff";
 const WIFI6_SWITCH_KEY: &str = "wifi6_switch";
@@ -433,10 +432,21 @@ pub fn wifi_set(_state: &AppState, body: &[u8]) -> (u16, Value) {
             )
         }
     };
-    let _guard = uci_transaction::WIFI_CHANGE.safe_lock();
+    let _guard = match uci_transaction::lock_wifi_change() {
+        Ok(guard) => guard,
+        Err(error) => return (503, json!({"ok": false, "error": error})),
+    };
     let changes = match plan_wifi(&parsed, &WifiConfig::load()) {
         Ok(changes) => changes,
         Err(error) => return (400, json!({"ok": false, "error": error})),
+    };
+    let _relay_hold = if changes.is_empty() {
+        None
+    } else {
+        match crate::wifi_uplink::hold_for_hotspot_change() {
+            Ok(hold) => Some(hold),
+            Err(error) => return (503, json!({"ok": false, "error": error})),
+        }
     };
     match uci_transaction::apply(&changes) {
         Ok(()) => (

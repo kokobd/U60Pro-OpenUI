@@ -41,6 +41,8 @@ mod usb;
 mod util;
 mod validate;
 mod wifi;
+mod wifi_maintenance;
+mod wifi_radio;
 mod wifi_uplink;
 mod wireguard;
 

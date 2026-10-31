@@ -5,12 +5,29 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 use crate::{process::BoundedCommand, ubus};
 
 pub static WIFI_CHANGE: Mutex<()> = Mutex::new(());
 static NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// Do not leave an HTTP handler waiting indefinitely behind a radio operation.
+pub fn lock_wifi_change() -> Result<MutexGuard<'static, ()>, String> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match WIFI_CHANGE.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Err(TryLockError::WouldBlock) => {}
+        }
+        if Instant::now() >= deadline {
+            return Err("Wi-Fi is busy with another operation; wait and retry".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Change {
@@ -94,7 +111,9 @@ impl Backend for UciStage {
         self.command(&["commit", config]).map(|_| ())
     }
     fn apply(&self) -> Result<(), String> {
-        ubus::call("zwrt_wlan", "reload", Some("{}")).map(|_| ())
+        // A successful ubus reply only accepts the reload. Keep the relay held
+        // until the intended APs agree with the driver, including on rollback.
+        crate::wifi_radio::reload_and_wait(Duration::from_secs(30))
     }
 }
 fn configs(changes: &[Change]) -> BTreeSet<&str> {
