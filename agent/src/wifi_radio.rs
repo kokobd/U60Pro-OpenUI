@@ -720,7 +720,9 @@ impl Backend for Native {
             .and_then(|value| value.split_whitespace().next())
             .and_then(decimal_us)
             .ok_or("Cannot read the Wi-Fi diagnostic clock")?;
-        let log = output("dmesg", &[], deadline)?;
+        // BusyBox requests the newest complete kernel records that fit. Reading
+        // the whole growing ring can exceed our output cap and disable monitoring.
+        let log = output("dmesg", &["-s", "262144"], deadline)?;
         let log = std::str::from_utf8(&log).map_err(|_| "Cannot read Wi-Fi diagnostic events")?;
         let log_watermark_us = log
             .lines()
