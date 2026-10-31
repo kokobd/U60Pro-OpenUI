@@ -1,5 +1,6 @@
 name: Safety and regression checks
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]
