@@ -97,13 +97,29 @@ the agent. It never writes UCI, init.d, stock firewall chains or main routes.
     prevent encryption-key installation and reject joins on both hotspot bands.
     The supervisor ignores historical kernel errors and normal ACS/DFS settling.
     A primary-frequency mismatch that persists for at least 15 seconds, accompanied
-    by a new `wait for csa event failed` event, permits one recovery: disable all
-    intended active APs before enabling any, then verify readiness and unchanged
-    saved/generated configuration. Disabled APs stay disabled. A failed recovery
-    or recurrence stops automatic attempts and reports a reason; it cannot enter a
-    restart loop. A coordinated settings change establishes a new monitoring
-    baseline and allowance. The monitor does not rewrite channel width, passwords,
-    SSIDs, firmware or boot services.
+    by a new `wait for csa event failed` event, permits one recovery. A coordinated
+    hotspot change also establishes a 120-second recovery window before the relay
+    resumes, once AP readiness and the current configuration are verified. During
+    that window, the same stable, stock-idle channel disagreement can trigger
+    recovery without a new key-install error: the resumed relay may stall before
+    any client attempts authentication. The AP names and configuration must still
+    match that baseline. Outside this window, a new CSA error is required.
+    Recovery disables all intended active APs before enabling any. For each band
+    with a frequency mismatch, it temporarily sets hostapd's runtime channel to
+    that AP's verified primary channel from before the stop, limited to an
+    explicit list of non-DFS channels. This prevents automatic channel selection
+    from choosing another channel during re-enable. The runtime pin lasts until
+    a stock Wi-Fi reload or hostapd restart; saved automatic-channel selection,
+    generated configuration and channel width remain unchanged. Recovery then
+    verifies readiness and the saved/generated configuration. If setting the
+    runtime channel, enabling an AP or verifying readiness fails, it attempts to
+    restore the original configured channels and re-enable every previously
+    active AP. Intentionally disabled APs stay disabled.
+    Both detection paths share one recovery attempt; failure or qualifying
+    recurrence stops automatic attempts and reports a reason. Another coordinated
+    settings change establishes a new monitoring baseline and allowance. This is
+    a runtime workaround: it does not patch the kernel or firmware, rewrite
+    passwords or SSIDs, or change boot services.
 
 ## API
 

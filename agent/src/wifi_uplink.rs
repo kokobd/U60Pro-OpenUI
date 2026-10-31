@@ -70,6 +70,9 @@ static LOCK: Mutex<()> = Mutex::new(());
 static SNAPSHOT: Mutex<Snapshot> = Mutex::new(Snapshot::new());
 /// Set by a save so the supervisor acts on it at once.
 static WAKE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+/// Only a caller that received a successful teardown acknowledgement can arm
+/// recovery on resume. A late worker acknowledgement after timeout cannot do so.
+static HOTSPOT_RESUME: AtomicU64 = AtomicU64::new(0);
 static LOGS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
 /// Until when login mode is on: traffic goes over the uplink before it passes the check,
@@ -1919,7 +1922,28 @@ fn wake() {
 pub fn hold_for_hotspot_change() -> Result<wifi_maintenance::Hold<'static>, String> {
     let mut hold = wifi_maintenance::begin(wake)?;
     hold.wait(Duration::from_secs(35))?;
+    let ticket = wifi_maintenance::pending()
+        .ok_or("The Wi-Fi maintenance request ended before relay resume was recorded")?;
+    HOTSPOT_RESUME.store(ticket, Ordering::Release);
     Ok(hold)
+}
+
+fn try_radio_operation<'a>(
+    operation: &'a Mutex<()>,
+    held_ticket: &mut Option<u64>,
+    acknowledged: &AtomicU64,
+) -> Option<(std::sync::MutexGuard<'a, ()>, bool)> {
+    let guard = match operation.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(TryLockError::WouldBlock) => return None,
+    };
+    // Hold release wakes us before the caller drops the operation lock. Consume
+    // its acknowledgement only after acquiring the lock, and only for that hold.
+    let after_change = held_ticket
+        .take()
+        .is_some_and(|ticket| acknowledged.swap(0, Ordering::AcqRel) == ticket);
+    Some((guard, after_change))
 }
 
 pub fn start() {
@@ -1974,15 +1998,18 @@ pub fn start() {
                 rt.view.reason =
                     Some("Applying hotspot settings; Wi-Fi relay is temporarily paused".into());
             } else {
-                held_ticket = None;
                 // Never block here: the settings handler may own WIFI_CHANGE
                 // while waiting for the teardown acknowledgement above.
-                let operation = match uci_transaction::WIFI_CHANGE.try_lock() {
-                    Ok(guard) => Some(guard),
-                    Err(TryLockError::Poisoned(error)) => Some(error.into_inner()),
-                    Err(TryLockError::WouldBlock) => None,
-                };
-                if let Some(_operation) = operation {
+                if let Some((_operation, after_change)) = try_radio_operation(
+                    &uci_transaction::WIFI_CHANGE,
+                    &mut held_ticket,
+                    &HOTSPOT_RESUME,
+                ) {
+                    // Establish the ready baseline before the resumed STA can
+                    // move channels. Failed verification keeps ordinary policy.
+                    if after_change && radio_monitor.after_hotspot_change().is_err() {
+                        log_line("uplink: post-change recovery was not armed because AP readiness or configuration could not be verified");
+                    }
                     match load() {
                         Ok(s) => {
                             if first && !s.enabled {
@@ -2215,6 +2242,61 @@ pub fn set_enabled(expected_revision: u64, enabled: bool) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hotspot_resume_waits_for_the_settings_lock_and_is_consumed_once() {
+        let operation = Mutex::new(());
+        let acknowledged = AtomicU64::new(23);
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let (retry_tx, retry_rx) = std::sync::mpsc::channel();
+        let timeout = Duration::from_secs(5);
+        let settings_guard = operation.lock().unwrap();
+
+        std::thread::scope(|scope| {
+            let operation = &operation;
+            let acknowledged = &acknowledged;
+            scope.spawn(move || {
+                let mut held_ticket = Some(23);
+                assert!(try_radio_operation(operation, &mut held_ticket, acknowledged).is_none());
+                assert_eq!(held_ticket, Some(23));
+                assert_eq!(acknowledged.load(Ordering::Acquire), 23);
+                blocked_tx.send(()).unwrap();
+                retry_rx.recv_timeout(timeout).unwrap();
+
+                let (guard, after_change) =
+                    try_radio_operation(operation, &mut held_ticket, acknowledged).unwrap();
+                assert!(after_change);
+                assert_eq!(held_ticket, None);
+                assert_eq!(acknowledged.load(Ordering::Acquire), 0);
+                assert!(matches!(
+                    operation.try_lock(),
+                    Err(TryLockError::WouldBlock)
+                ));
+                drop(guard);
+
+                let (_guard, after_change) =
+                    try_radio_operation(operation, &mut held_ticket, acknowledged).unwrap();
+                assert!(!after_change);
+            });
+            blocked_rx.recv_timeout(timeout).unwrap();
+            drop(settings_guard);
+            retry_tx.send(()).unwrap();
+        });
+    }
+
+    #[test]
+    fn cancelled_or_stale_hotspot_acknowledgements_do_not_arm_resume() {
+        for acknowledgement in [0, 22] {
+            let operation = Mutex::new(());
+            let acknowledged = AtomicU64::new(acknowledgement);
+            let mut held_ticket = Some(23);
+            let (_guard, after_change) =
+                try_radio_operation(&operation, &mut held_ticket, &acknowledged).unwrap();
+            assert!(!after_change);
+            assert_eq!(held_ticket, None);
+            assert_eq!(acknowledged.load(Ordering::Acquire), 0);
+        }
+    }
 
     fn net(id: u64, ssid: &str, security: Security, password: &str) -> Network {
         Network {

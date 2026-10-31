@@ -1,8 +1,8 @@
 //! AP readiness and one bounded recovery of the Qualcomm CSA/key-install stall.
 //!
-//! Callers must hold the shared radio-operation lock. This module never changes
-//! UCI, credentials, channels or channel geometry. A healthy upstream connection
-//! is not evidence that hotspot clients can associate.
+//! Callers must hold the shared radio-operation lock. Recovery can temporarily
+//! pin a mismatched AP's runtime channel; UCI, credentials and channel geometry
+//! are unchanged. A healthy upstream does not prove hotspot clients can associate.
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
@@ -13,8 +13,10 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 const STABLE_MISMATCH: Duration = Duration::from_secs(15);
+const POST_CHANGE_WINDOW: Duration = Duration::from_secs(120);
 const SAMPLE_TIMEOUT: Duration = Duration::from_secs(12);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const CHANNEL_RESTORE_TIMEOUT: Duration = Duration::from_secs(15);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(300);
 const LIMIT: usize = 2 * 1024 * 1024;
@@ -112,19 +114,83 @@ struct Pending {
     fresh_error: bool,
 }
 
+struct PostChange {
+    until: Instant,
+    interfaces: Vec<String>,
+    fingerprint: [u8; 32],
+}
+
+struct ChannelPlan {
+    iface: String,
+    target: u16,
+    original: u16,
+}
+
 /// One monitor belongs to one supervisor lifetime. Replacing it explicitly after
 /// a coordinated settings operation also establishes a new kernel-log baseline.
-/// No historical error count, unreadable sample, or lone mismatch can restart APs.
+/// Outside the verified post-change window, a new CSA error is also required.
+/// Historical errors and unreadable samples never authorize a restart.
 #[derive(Default)]
 pub struct Monitor {
     watermark_us: Option<u64>,
     last_uptime_us: Option<u64>,
     pending: Option<Pending>,
+    post_change: Option<PostChange>,
     attempted: bool,
     failure: Option<String>,
 }
 
 impl Monitor {
+    /// Call under the radio-operation lock after a settings hold is released and
+    /// before the first resumed relay step. A verified ready configuration gets
+    /// a short settling window; this does not reset the recovery/error latch.
+    pub fn after_hotspot_change(&mut self) -> Result<(), String> {
+        self.after_hotspot_change_with(&mut Native)
+    }
+
+    fn after_hotspot_change_with(&mut self, backend: &mut impl Backend) -> Result<(), String> {
+        self.post_change = None;
+        self.pending = None;
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        let deadline = backend.now() + SAMPLE_TIMEOUT;
+        let sample = backend.sample(deadline)?;
+        if !sample.ready() {
+            return Err("Hotspot readiness was not verified before resuming Wi-Fi relay".into());
+        }
+        let interfaces: Vec<_> = sample
+            .aps
+            .iter()
+            .filter(|ap| ap.intended)
+            .map(|ap| ap.iface.clone())
+            .collect();
+        let fingerprint = backend.fingerprint(&interfaces, deadline)?;
+        if backend.sample(deadline)? != sample {
+            return Err("Hotspot state changed before resuming Wi-Fi relay".into());
+        }
+        self.post_change = Some(PostChange {
+            until: backend.now() + POST_CHANGE_WINDOW,
+            interfaces,
+            fingerprint,
+        });
+        Ok(())
+    }
+
+    fn post_change_matches(&mut self, backend: &mut impl Backend, deadline: Instant) -> bool {
+        let Some(window) = &self.post_change else {
+            return false;
+        };
+        if backend.now() >= window.until
+            || backend.fingerprint(&window.interfaces, deadline).ok() != Some(window.fingerprint)
+            || backend.now() >= window.until
+        {
+            self.post_change = None;
+            return false;
+        }
+        true
+    }
+
     /// Establish a read-only baseline before a coordinated operation can emit
     /// CSA errors. A failed read makes the next successful check baseline only.
     /// This does not reset a spent recovery allowance or a latched error.
@@ -159,6 +225,7 @@ impl Monitor {
             return Err(error.clone());
         }
         let deadline = backend.now() + SAMPLE_TIMEOUT;
+        let post_change = self.post_change_matches(backend, deadline);
         let evidence = match backend.evidence(deadline) {
             Ok(value) => value,
             Err(_) => {
@@ -206,7 +273,21 @@ impl Monitor {
             }
         }
         let pending = self.pending.as_ref().unwrap();
-        if now.duration_since(pending.since) < STABLE_MISMATCH || !pending.fresh_error {
+        let fresh_error = pending.fresh_error;
+        if self
+            .post_change
+            .as_ref()
+            .is_some_and(|window| now >= window.until)
+        {
+            self.post_change = None;
+        }
+        let post_change = post_change
+            && self.post_change.is_some()
+            && sample
+                .aps
+                .iter()
+                .all(|ap| !ap.intended || ap.ssid_matches == Some(true));
+        if now.duration_since(pending.since) < STABLE_MISMATCH || !(fresh_error || post_change) {
             return Ok(None);
         }
         if self.attempted {
@@ -218,6 +299,13 @@ impl Monitor {
             .filter(|ap| ap.intended)
             .map(|ap| ap.iface.clone())
             .collect();
+        let targets: Vec<_> = sample.aps.iter()
+            .filter(|ap| ap.intended && ap.host_frequency != ap.driver_frequency)
+            .map(|ap| {
+                let target = ap.host_frequency.and_then(target_channel)
+                    .ok_or_else(|| "Wi-Fi recovery target is outside the supported non-DFS channels; no reset was attempted".to_string())?;
+                Ok((ap.iface.clone(), target))
+            }).collect::<Result<_, String>>()?;
         let before = match backend.fingerprint(&interfaces, deadline) {
             Ok(value) => value,
             Err(_) => {
@@ -225,6 +313,23 @@ impl Monitor {
                 return Ok(None);
             }
         };
+        let channels: Vec<_> = targets
+            .into_iter()
+            .map(|(iface, target)| {
+                let original = backend.configured_channel(&iface, deadline)?;
+                if original != 0 && !supported_channel(original) {
+                    return Err(
+                        "Original Wi-Fi channel policy is unsupported; no reset was attempted"
+                            .into(),
+                    );
+                }
+                Ok(ChannelPlan {
+                    iface,
+                    target,
+                    original,
+                })
+            })
+            .collect::<Result<_, String>>()?;
         // The samples above are observations, not a claim on the stock service.
         // Recheck immediately before the first write as it does not share our lock.
         match backend.sample(deadline) {
@@ -234,9 +339,26 @@ impl Monitor {
                 return Ok(None);
             }
         }
+        if backend.fingerprint(&interfaces, deadline).ok() != Some(before) {
+            self.pending = None;
+            self.post_change = None;
+            return Ok(None);
+        }
+        // The settling window grants permission only for the captured settings,
+        // including immediately before the first mutation. A fresh CSA error
+        // remains an independent background-recovery gate.
+        let window_still_matches = self.post_change_matches(backend, deadline)
+            && self
+                .post_change
+                .as_ref()
+                .is_some_and(|window| window.fingerprint == before);
+        if !fresh_error && !window_still_matches {
+            self.pending = None;
+            return Ok(None);
+        }
         self.attempted = true;
         self.pending = None;
-        if let Err(error) = recover(backend, &interfaces, before) {
+        if let Err(error) = recover(backend, &interfaces, &channels, before) {
             return self.fail(&error);
         }
         Ok(Some(
@@ -329,10 +451,12 @@ fn wait_ready_with(backend: &mut impl Backend, deadline: Instant) -> Result<(), 
 fn recover(
     backend: &mut impl Backend,
     interfaces: &[String],
+    channels: &[ChannelPlan],
     before: [u8; 32],
 ) -> Result<(), String> {
     let deadline = backend.now() + RECOVERY_TIMEOUT;
-    let stopped = (|| {
+    let mut channel_set_attempted = false;
+    let result = (|| {
         // CSA completion is shared: never enable the first AP while the second
         // AP is still being stopped. Restore every original active AP on error.
         for iface in interfaces {
@@ -352,29 +476,73 @@ fn recover(
         if backend.fingerprint(interfaces, deadline)? != before {
             return Err("Wi-Fi settings changed during recovery".to_string());
         }
+        for channel in channels {
+            // Even a rejected SET can mutate hostapd before config validation.
+            channel_set_attempted = true;
+            backend.set_channel(&channel.iface, channel.target, deadline)?;
+        }
+        for iface in interfaces {
+            backend.control(iface, "ENABLE", deadline)?;
+        }
+        wait_ready_with(backend, deadline)?;
+        if backend.fingerprint(interfaces, deadline)? != before {
+            return Err("Wi-Fi settings changed during recovery".to_string());
+        }
         Ok(())
     })();
-
-    // A separate small restoration budget also covers an expired stop deadline.
-    // Continue through all APs even if one enable command fails.
-    let restore_deadline = backend.now() + COMMAND_TIMEOUT * (interfaces.len() as u32 + 1);
-    let mut enable_failed = false;
+    if result.is_ok() {
+        return Ok(());
+    }
+    if channel_set_attempted {
+        let restore_deadline = backend.now() + CHANNEL_RESTORE_TIMEOUT;
+        for iface in interfaces {
+            let _ = backend.control(iface, "DISABLE", restore_deadline);
+        }
+        let state_deadline = restore_deadline - COMMAND_TIMEOUT * channels.len() as u32;
+        let all_disabled = loop {
+            if remaining(state_deadline, backend.now()).is_err() {
+                break false;
+            }
+            let mut stopped = true;
+            for iface in interfaces {
+                stopped &= backend
+                    .state(iface, state_deadline)
+                    .is_ok_and(|state| state == "DISABLED");
+            }
+            if stopped {
+                break true;
+            }
+            let Ok(left) = remaining(state_deadline, backend.now()) else {
+                break false;
+            };
+            backend.sleep(POLL.min(left));
+        };
+        if all_disabled {
+            for channel in channels {
+                let _ = backend.set_channel(&channel.iface, channel.original, restore_deadline);
+            }
+        }
+    }
+    // A fresh small budget guarantees an enable attempt for every original AP,
+    // including when the recovery or channel-policy restoration timed out.
+    let enable_deadline = backend.now() + COMMAND_TIMEOUT * (interfaces.len() as u32 + 1);
     for iface in interfaces {
-        enable_failed |= backend.control(iface, "ENABLE", restore_deadline).is_err();
+        let _ = backend.control(iface, "ENABLE", enable_deadline);
     }
-    if stopped.is_err() || enable_failed {
-        return Err("Wi-Fi recovery failed; re-enabling every previously active AP was attempted and automatic recovery is stopped".into());
+    Err("Wi-Fi recovery failed; original channel-policy restoration and re-enabling all previously active APs were attempted; automatic recovery is stopped".into())
+}
+
+fn target_channel(frequency: u32) -> Option<u16> {
+    if let Some(channel) = (1u16..=13).find(|channel| 2407 + u32::from(*channel) * 5 == frequency) {
+        return Some(channel);
     }
-    if wait_ready_with(backend, deadline).is_err() {
-        return Err(
-            "Wi-Fi recovery did not reach a verified ready state; automatic recovery is stopped"
-                .into(),
-        );
-    }
-    if backend.fingerprint(interfaces, deadline)? != before {
-        return Err("Wi-Fi settings changed during recovery; automatic recovery is stopped".into());
-    }
-    Ok(())
+    [36u16, 40, 44, 48, 149, 153, 157, 161, 165]
+        .into_iter()
+        .find(|channel| 5000 + u32::from(*channel) * 5 == frequency)
+}
+
+fn supported_channel(channel: u16) -> bool {
+    (1..=13).contains(&channel) || [36, 40, 44, 48, 149, 153, 157, 161, 165].contains(&channel)
 }
 
 trait Backend {
@@ -392,6 +560,8 @@ trait Backend {
         -> Result<[u8; 32], String>;
     fn control(&mut self, iface: &str, command: &str, deadline: Instant) -> Result<(), String>;
     fn state(&mut self, iface: &str, deadline: Instant) -> Result<String, String>;
+    fn configured_channel(&mut self, iface: &str, deadline: Instant) -> Result<u16, String>;
+    fn set_channel(&mut self, iface: &str, channel: u16, deadline: Instant) -> Result<(), String>;
 }
 
 fn remaining(deadline: Instant, now: Instant) -> Result<Duration, String> {
@@ -598,6 +768,46 @@ impl Backend for Native {
             .map(str::to_string)
             .ok_or_else(|| "Cannot read hotspot state".into())
     }
+
+    fn configured_channel(&mut self, iface: &str, deadline: Instant) -> Result<u16, String> {
+        remaining(deadline, self.now())?;
+        if !valid_iface(iface) {
+            return Err("Invalid hotspot interface".into());
+        }
+        let config = read_small(
+            &PathBuf::from(format!("/data/vendor/wifi/hostapd-{iface}.conf")),
+            LIMIT,
+        )?;
+        let config = std::str::from_utf8(&config)
+            .map_err(|_| "Cannot read original hotspot channel policy")?;
+        configured_channel(config)
+    }
+
+    fn set_channel(&mut self, iface: &str, channel: u16, deadline: Instant) -> Result<(), String> {
+        if channel != 0 && !supported_channel(channel) {
+            return Err("Unsupported hotspot channel policy".into());
+        }
+        let channel = channel.to_string();
+        if hostapd_command(iface, &["set", "channel", &channel], deadline)?.trim() != "OK" {
+            return Err("Hotspot rejected the runtime channel policy".into());
+        }
+        Ok(())
+    }
+}
+
+fn configured_channel(config: &str) -> Result<u16, String> {
+    let mut values = config.lines().filter_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "channel").then_some(value.trim())
+    });
+    let channel = values
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|channel| *channel == 0 || supported_channel(*channel));
+    if values.next().is_some() {
+        return Err("Original hotspot channel policy is ambiguous".into());
+    }
+    channel.ok_or_else(|| "Original hotspot channel policy is unsupported or unreadable".into())
 }
 
 fn output(program: &str, args: &[&str], deadline: Instant) -> Result<Vec<u8>, String> {
@@ -800,20 +1010,26 @@ fn kernel_timestamp(line: &str) -> Option<u64> {
 }
 
 fn hostapd(iface: &str, command: &str, deadline: Instant) -> Result<String, String> {
-    if !valid_iface(iface) {
-        return Err("Invalid hotspot control request".into());
-    }
     let command = match command {
         "STATUS" => "status",
         "DISABLE" => "disable",
         "ENABLE" => "enable",
         _ => return Err("Invalid hotspot control request".into()),
     };
+    hostapd_command(iface, &[command], deadline)
+}
+
+fn hostapd_command(iface: &str, args: &[&str], deadline: Instant) -> Result<String, String> {
+    if !valid_iface(iface) {
+        return Err("Invalid hotspot control request".into());
+    }
     // The firmware client creates a reply socket accessible to the unprivileged
     // hostapd daemon; a root-only client socket directory prevents its replies.
     let timeout = COMMAND_TIMEOUT.min(remaining(deadline, Instant::now())?);
     let reply = process_runner::output(
-        Command::new("hostapd_cli").args(["-p", CTRL, "-i", iface, command]),
+        Command::new("hostapd_cli")
+            .args(["-p", CTRL, "-i", iface])
+            .args(args),
         None,
         timeout,
         16384,
@@ -828,13 +1044,14 @@ fn hostapd(iface: &str, command: &str, deadline: Instant) -> Result<String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::{HashMap, HashSet, VecDeque};
 
     struct Fake {
         now: Instant,
         elapsed: Duration,
         sample: Sample,
         samples: VecDeque<Sample>,
+        sample_delay: Duration,
         generation: Generation,
         generations: VecDeque<Result<Generation, String>>,
         reloads: usize,
@@ -845,7 +1062,14 @@ mod tests {
         disabled: HashSet<String>,
         fail_command: Option<(String, String)>,
         changed: bool,
+        fingerprint_value: u8,
+        fingerprint_error: bool,
         repair: bool,
+        configured_channels: HashMap<String, u16>,
+        runtime_channels: HashMap<String, u16>,
+        acs_reroll: bool,
+        restore_state_delay: u32,
+        restore_state_errors: bool,
     }
 
     impl Fake {
@@ -876,6 +1100,7 @@ mod tests {
                     ],
                 },
                 samples: VecDeque::new(),
+                sample_delay: Duration::ZERO,
                 generation: ["wlan0", "wlan2"]
                     .into_iter()
                     .enumerate()
@@ -894,7 +1119,14 @@ mod tests {
                 disabled: HashSet::new(),
                 fail_command: None,
                 changed: false,
+                fingerprint_value: 0,
+                fingerprint_error: false,
                 repair: true,
+                configured_channels: [("wlan0".into(), 0), ("wlan2".into(), 0)].into(),
+                runtime_channels: [("wlan0".into(), 0), ("wlan2".into(), 0)].into(),
+                acs_reroll: false,
+                restore_state_delay: 0,
+                restore_state_errors: false,
             }
         }
         fn advance(&mut self, seconds: u64) {
@@ -929,6 +1161,7 @@ mod tests {
             })
         }
         fn sample(&mut self, _: Instant) -> Result<Sample, String> {
+            self.elapsed += self.sample_delay;
             if self.read_error {
                 return Err("unreadable".into());
             }
@@ -947,7 +1180,10 @@ mod tests {
             Ok(())
         }
         fn fingerprint(&mut self, _: &[String], _: Instant) -> Result<[u8; 32], String> {
-            Ok([u8::from(self.changed && !self.commands.is_empty()); 32])
+            if self.fingerprint_error {
+                return Err("unreadable".into());
+            }
+            Ok([self.fingerprint_value + u8::from(self.changed && !self.commands.is_empty()); 32])
         }
         fn control(&mut self, iface: &str, command: &str, _: Instant) -> Result<(), String> {
             self.commands.push((iface.into(), command.into()));
@@ -959,7 +1195,8 @@ mod tests {
             }
             if command == "ENABLE" {
                 self.disabled.remove(iface);
-                if self.repair {
+                if self.repair && (!self.acs_reroll || self.runtime_channels.get(iface) != Some(&0))
+                {
                     for ap in &mut self.sample.aps {
                         if ap.iface == iface {
                             ap.driver_frequency = ap.host_frequency;
@@ -970,12 +1207,48 @@ mod tests {
             Ok(())
         }
         fn state(&mut self, iface: &str, _: Instant) -> Result<String, String> {
+            if self.restore_state_delay > 0
+                && self
+                    .commands
+                    .iter()
+                    .any(|(_, command)| command.starts_with("SET "))
+            {
+                self.restore_state_delay -= 1;
+                return if self.restore_state_errors {
+                    Err("unreadable".into())
+                } else {
+                    Ok("UNINITIALIZED".into())
+                };
+            }
             Ok(if self.disabled.contains(iface) {
                 "DISABLED"
             } else {
                 "ENABLED"
             }
             .into())
+        }
+        fn configured_channel(&mut self, iface: &str, _: Instant) -> Result<u16, String> {
+            self.configured_channels
+                .get(iface)
+                .copied()
+                .ok_or_else(|| "unreadable".into())
+        }
+        fn set_channel(&mut self, iface: &str, channel: u16, _: Instant) -> Result<(), String> {
+            assert!(
+                self.sample
+                    .aps
+                    .iter()
+                    .filter(|ap| ap.intended)
+                    .all(|ap| self.disabled.contains(&ap.iface)),
+                "every active AP must stop before SET"
+            );
+            let command = format!("SET channel {channel}");
+            self.commands.push((iface.into(), command.clone()));
+            self.runtime_channels.insert(iface.into(), channel);
+            if self.fail_command.as_ref() == Some(&(iface.into(), command)) {
+                return Err("failed after mutating runtime channel".into());
+            }
+            Ok(())
         }
     }
 
@@ -1001,6 +1274,8 @@ mod tests {
             vec![
                 ("wlan0".into(), "DISABLE".into()),
                 ("wlan2".into(), "DISABLE".into()),
+                ("wlan0".into(), "SET channel 7".into()),
+                ("wlan2".into(), "SET channel 40".into()),
                 ("wlan0".into(), "ENABLE".into()),
                 ("wlan2".into(), "ENABLE".into())
             ]
@@ -1024,11 +1299,11 @@ mod tests {
         fake.advance(15);
         fake.fresh();
         assert!(monitor.check_with(&mut fake).is_err());
-        assert_eq!(fake.commands.len(), 4);
+        assert_eq!(fake.commands.len(), 6);
         assert!(monitor.check_with(&mut fake).is_err());
         monitor.baseline_with(&mut fake);
         assert!(monitor.check_with(&mut fake).is_err());
-        assert_eq!(fake.commands.len(), 4);
+        assert_eq!(fake.commands.len(), 6);
     }
 
     #[test]
@@ -1041,6 +1316,179 @@ mod tests {
         assert!(monitor.check_with(&mut fake).unwrap().is_none());
         fake.advance(15);
         assert!(monitor.check_with(&mut fake).unwrap().is_some());
+    }
+
+    #[test]
+    fn verified_post_change_window_recovers_resume_mismatch_without_a_new_csa_error() {
+        let mut fake = Fake::new();
+        fake.sample.aps[0].host_frequency = Some(2412);
+        fake.ready();
+        let mut monitor = Monitor::default();
+        monitor.after_hotspot_change_with(&mut fake).unwrap();
+        fake.sample.aps[1].driver_frequency = Some(5240);
+        assert!(monitor.check_with(&mut fake).unwrap().is_none());
+        fake.advance(14);
+        assert!(monitor.check_with(&mut fake).unwrap().is_none());
+        assert!(fake.commands.is_empty());
+        fake.advance(1);
+        assert!(monitor.check_with(&mut fake).unwrap().is_some());
+        assert_eq!(
+            fake.commands,
+            vec![
+                ("wlan0".into(), "DISABLE".into()),
+                ("wlan2".into(), "DISABLE".into()),
+                ("wlan2".into(), "SET channel 40".into()),
+                ("wlan0".into(), "ENABLE".into()),
+                ("wlan2".into(), "ENABLE".into()),
+            ]
+        );
+        assert!(fake.sample.ready());
+        assert_eq!(fake.event_us, Some(90_000_000));
+        assert!(monitor.post_change.is_some());
+    }
+
+    #[test]
+    fn post_change_window_requires_ready_runtime_and_readable_fingerprint() {
+        for fault in ["unknown", "busy", "ssid", "mismatch", "config", "read"] {
+            let mut fake = Fake::new();
+            fake.ready();
+            match fault {
+                "unknown" => fake.sample.aps[0].state = "UNKNOWN".into(),
+                "busy" => fake.sample.idle = false,
+                "ssid" => fake.sample.aps[0].ssid_matches = Some(false),
+                "mismatch" => fake.sample.aps[1].driver_frequency = Some(5240),
+                "config" => fake.fingerprint_error = true,
+                "read" => fake.read_error = true,
+                _ => unreachable!(),
+            }
+            let mut monitor = Monitor::default();
+            assert!(
+                monitor.after_hotspot_change_with(&mut fake).is_err(),
+                "{fault}"
+            );
+            assert!(monitor.post_change.is_none());
+            assert!(fake.commands.is_empty());
+        }
+    }
+
+    #[test]
+    fn ready_samples_do_not_consume_post_change_permission() {
+        let mut fake = Fake::new();
+        fake.ready();
+        let mut monitor = Monitor::default();
+        monitor.after_hotspot_change_with(&mut fake).unwrap();
+        assert!(monitor.check_with(&mut fake).unwrap().is_none());
+        fake.advance(3);
+        assert!(monitor.check_with(&mut fake).unwrap().is_none());
+        assert!(monitor.post_change.is_some());
+        fake.sample.aps[1].driver_frequency = Some(5240);
+        assert!(monitor.check_with(&mut fake).unwrap().is_none());
+        fake.advance(15);
+        assert!(monitor.check_with(&mut fake).unwrap().is_some());
+    }
+
+    #[test]
+    fn post_change_permission_is_revoked_by_expiry_config_change_or_read_error() {
+        for revoked_by in ["expired", "changed", "unreadable"] {
+            let mut fake = Fake::new();
+            fake.ready();
+            let mut monitor = Monitor::default();
+            monitor.after_hotspot_change_with(&mut fake).unwrap();
+            fake.sample.aps[1].driver_frequency = Some(5240);
+            assert!(monitor.check_with(&mut fake).unwrap().is_none());
+            match revoked_by {
+                "expired" => fake.advance(120),
+                "changed" => {
+                    fake.advance(15);
+                    fake.fingerprint_value = 1;
+                }
+                "unreadable" => {
+                    fake.advance(15);
+                    fake.fingerprint_error = true;
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                monitor.check_with(&mut fake).unwrap().is_none(),
+                "{revoked_by}"
+            );
+            assert!(monitor.post_change.is_none());
+            fake.fingerprint_value = 0;
+            fake.fingerprint_error = false;
+            fake.advance(15);
+            assert!(monitor.check_with(&mut fake).unwrap().is_none());
+            assert!(fake.commands.is_empty());
+            fake.advance(1);
+            fake.fresh();
+            assert!(monitor.check_with(&mut fake).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn post_change_recurrence_latches_without_a_new_csa_error_or_second_cycle() {
+        let mut fake = Fake::new();
+        fake.ready();
+        let mut monitor = Monitor::default();
+        monitor.after_hotspot_change_with(&mut fake).unwrap();
+        for recurrence in [false, true] {
+            fake.sample.aps[1].driver_frequency = Some(5240);
+            assert!(monitor.check_with(&mut fake).unwrap().is_none());
+            fake.advance(15);
+            let result = monitor.check_with(&mut fake);
+            if recurrence {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_some());
+            }
+        }
+        assert_eq!(fake.commands.len(), 5);
+        fake.ready();
+        assert!(monitor.after_hotspot_change_with(&mut fake).is_err());
+        assert!(monitor.check_with(&mut fake).is_err());
+        assert_eq!(fake.commands.len(), 5);
+    }
+
+    #[test]
+    fn post_change_window_does_not_authorize_wrong_ssid_or_unarmed_background_mismatch() {
+        for armed in [false, true] {
+            let mut fake = Fake::new();
+            fake.ready();
+            let mut monitor = Monitor::default();
+            if armed {
+                monitor.after_hotspot_change_with(&mut fake).unwrap();
+            }
+            fake.sample.aps[1].driver_frequency = Some(5240);
+            if armed {
+                fake.sample.aps[1].ssid_matches = Some(false);
+            }
+            assert!(monitor.check_with(&mut fake).unwrap().is_none());
+            fake.advance(30);
+            assert!(monitor.check_with(&mut fake).unwrap().is_none());
+            assert!(fake.commands.is_empty());
+        }
+    }
+
+    #[test]
+    fn expiry_during_observation_cannot_latch_a_recurrence_without_new_csa() {
+        let mut fake = Fake::new();
+        fake.ready();
+        let mut monitor = Monitor::default();
+        monitor.after_hotspot_change_with(&mut fake).unwrap();
+        fake.sample.aps[1].driver_frequency = Some(5240);
+        assert!(monitor.check_with(&mut fake).unwrap().is_none());
+        fake.advance(15);
+        assert!(monitor.check_with(&mut fake).unwrap().is_some());
+        fake.sample.aps[1].driver_frequency = Some(5240);
+        assert!(monitor.check_with(&mut fake).unwrap().is_none());
+        fake.sleep(Duration::from_secs(119) - fake.elapsed);
+        fake.sample_delay = Duration::from_secs(2);
+        assert!(monitor.check_with(&mut fake).unwrap().is_none());
+        assert!(monitor.post_change.is_none());
+        assert!(monitor.failure.is_none());
+        assert_eq!(fake.commands.len(), 5);
+        fake.fresh();
+        assert!(monitor.check_with(&mut fake).is_err());
+        assert_eq!(fake.commands.len(), 5);
     }
 
     #[test]
@@ -1104,9 +1552,10 @@ mod tests {
             fake.repair = changed;
             assert!(monitor.check_with(&mut fake).is_err());
             assert!(fake.disabled.is_empty());
-            assert_eq!(fake.commands.len(), 4);
+            let count = fake.commands.len();
+            assert_eq!(count, if changed { 4 } else { 12 });
             assert!(monitor.check_with(&mut fake).is_err());
-            assert_eq!(fake.commands.len(), 4);
+            assert_eq!(fake.commands.len(), count);
         }
     }
 
@@ -1122,9 +1571,181 @@ mod tests {
             fake.commands,
             vec![
                 ("wlan2".into(), "DISABLE".into()),
+                ("wlan2".into(), "SET channel 40".into()),
                 ("wlan2".into(), "ENABLE".into())
             ]
         );
+    }
+
+    #[test]
+    fn channel_pin_prevents_acs_reroll_and_only_changes_the_mismatched_ap() {
+        let mut fake = Fake::new();
+        fake.ready();
+        fake.sample.aps[1].driver_frequency = Some(5240);
+        fake.acs_reroll = true;
+        let mut monitor = Monitor::default();
+        prime(&mut monitor, &mut fake);
+        assert!(monitor.check_with(&mut fake).unwrap().is_some());
+        assert_eq!(
+            fake.commands,
+            vec![
+                ("wlan0".into(), "DISABLE".into()),
+                ("wlan2".into(), "DISABLE".into()),
+                ("wlan2".into(), "SET channel 40".into()),
+                ("wlan0".into(), "ENABLE".into()),
+                ("wlan2".into(), "ENABLE".into()),
+            ]
+        );
+        assert_eq!(fake.runtime_channels["wlan0"], 0);
+        assert_eq!(fake.runtime_channels["wlan2"], 40);
+        assert_eq!(fake.configured_channels["wlan2"], 0);
+        assert!(fake.sample.ready());
+    }
+
+    #[test]
+    fn failed_set_restores_original_policy_even_when_rejected_set_mutated_runtime() {
+        let mut fake = Fake::new();
+        fake.configured_channels.insert("wlan2".into(), 44);
+        fake.runtime_channels.insert("wlan2".into(), 44);
+        fake.fail_command = Some(("wlan2".into(), "SET channel 40".into()));
+        let mut monitor = Monitor::default();
+        prime(&mut monitor, &mut fake);
+        assert!(monitor.check_with(&mut fake).is_err());
+        assert_eq!(fake.runtime_channels, fake.configured_channels);
+        assert_eq!(
+            fake.commands,
+            vec![
+                ("wlan0".into(), "DISABLE".into()),
+                ("wlan2".into(), "DISABLE".into()),
+                ("wlan0".into(), "SET channel 7".into()),
+                ("wlan2".into(), "SET channel 40".into()),
+                ("wlan0".into(), "DISABLE".into()),
+                ("wlan2".into(), "DISABLE".into()),
+                ("wlan0".into(), "SET channel 0".into()),
+                ("wlan2".into(), "SET channel 44".into()),
+                ("wlan0".into(), "ENABLE".into()),
+                ("wlan2".into(), "ENABLE".into()),
+            ]
+        );
+        let commands = fake.commands.clone();
+        assert!(monitor.check_with(&mut fake).is_err());
+        assert_eq!(fake.commands, commands);
+    }
+
+    #[test]
+    fn enable_and_readiness_failures_restore_auto_channel_before_final_enable() {
+        for enable_fails in [false, true] {
+            let mut fake = Fake::new();
+            fake.repair = enable_fails;
+            if enable_fails {
+                fake.fail_command = Some(("wlan0".into(), "ENABLE".into()));
+            }
+            let mut monitor = Monitor::default();
+            prime(&mut monitor, &mut fake);
+            assert!(monitor.check_with(&mut fake).is_err());
+            assert_eq!(fake.runtime_channels, fake.configured_channels);
+            assert_eq!(
+                &fake.commands[fake.commands.len() - 4..],
+                &[
+                    ("wlan0".into(), "SET channel 0".into()),
+                    ("wlan2".into(), "SET channel 0".into()),
+                    ("wlan0".into(), "ENABLE".into()),
+                    ("wlan2".into(), "ENABLE".into()),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn restoration_waits_for_transient_or_unreadable_disabled_state() {
+        for unreadable in [false, true] {
+            let mut fake = Fake::new();
+            fake.restore_state_delay = 2;
+            fake.restore_state_errors = unreadable;
+            fake.fail_command = Some(("wlan2".into(), "SET channel 40".into()));
+            let mut monitor = Monitor::default();
+            prime(&mut monitor, &mut fake);
+            let before = fake.elapsed;
+            assert!(monitor.check_with(&mut fake).is_err());
+            assert!(fake.elapsed - before >= POLL);
+            assert_eq!(fake.runtime_channels, fake.configured_channels);
+            assert!(fake.disabled.is_empty());
+        }
+    }
+
+    #[test]
+    fn restoration_deadline_never_sets_on_unconfirmed_aps_and_still_enables_every_ap() {
+        let mut fake = Fake::new();
+        fake.restore_state_delay = 1000;
+        fake.fail_command = Some(("wlan2".into(), "SET channel 40".into()));
+        let mut monitor = Monitor::default();
+        prime(&mut monitor, &mut fake);
+        let before = fake.elapsed;
+        assert!(monitor.check_with(&mut fake).is_err());
+        assert!(fake.elapsed - before <= CHANNEL_RESTORE_TIMEOUT);
+        assert!(!fake
+            .commands
+            .iter()
+            .any(|(_, command)| command == "SET channel 0"));
+        assert_eq!(
+            &fake.commands[fake.commands.len() - 2..],
+            &[
+                ("wlan0".into(), "ENABLE".into()),
+                ("wlan2".into(), "ENABLE".into()),
+            ]
+        );
+        assert!(fake.disabled.is_empty());
+    }
+
+    #[test]
+    fn unsupported_targets_or_unreadable_original_policy_never_mutate() {
+        for fault in [
+            "dfs",
+            "channel14",
+            "6ghz",
+            "original_dfs",
+            "original_missing",
+        ] {
+            let mut fake = Fake::new();
+            match fault {
+                "dfs" => fake.sample.aps[1].host_frequency = Some(5260),
+                "channel14" => fake.sample.aps[0].host_frequency = Some(2484),
+                "6ghz" => fake.sample.aps[1].host_frequency = Some(5955),
+                "original_dfs" => {
+                    fake.configured_channels.insert("wlan2".into(), 52);
+                }
+                "original_missing" => {
+                    fake.configured_channels.remove("wlan2");
+                }
+                _ => unreachable!(),
+            }
+            let mut monitor = Monitor::default();
+            prime(&mut monitor, &mut fake);
+            assert!(monitor.check_with(&mut fake).is_err(), "{fault}");
+            assert!(fake.commands.is_empty());
+            assert!(!monitor.attempted);
+        }
+        for channel in [1, 6, 13, 36, 40, 44, 48, 149, 153, 157, 161, 165] {
+            let frequency = if channel <= 13 {
+                2407 + channel * 5
+            } else {
+                5000 + channel * 5
+            };
+            assert_eq!(target_channel(frequency), Some(channel as u16));
+            assert_eq!(
+                configured_channel(&format!("channel={channel}\n")),
+                Ok(channel as u16)
+            );
+        }
+        assert_eq!(configured_channel("channel=0\n"), Ok(0));
+        for config in [
+            "",
+            "channel=bad\n",
+            "channel=0\nchannel=40\n",
+            "channel=52\n",
+        ] {
+            assert!(configured_channel(config).is_err());
+        }
     }
 
     #[test]
