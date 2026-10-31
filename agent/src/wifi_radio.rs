@@ -299,8 +299,8 @@ fn reload_and_wait_with(backend: &mut impl Backend, deadline: Instant) -> Result
                 required.iter().all(|index| transitioned[*index])
             };
         // Missing is a concrete marker value; permission/I/O failures are not.
-        if generation_seen && current.is_ok() && sample.ready() {
-            let ready = (sample, current.unwrap());
+        if let (true, Ok(current)) = (generation_seen && sample.ready(), current) {
+            let ready = (sample, current);
             if previous.as_ref() == Some(&ready) {
                 return Ok(());
             }
