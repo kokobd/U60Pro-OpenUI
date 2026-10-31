@@ -102,8 +102,13 @@ the agent. It never writes UCI, init.d, stock firewall chains or main routes.
     resumes, once AP readiness and the current configuration are verified. During
     that window, the same stable, stock-idle channel disagreement can trigger
     recovery without a new key-install error: the resumed relay may stall before
-    any client attempts authentication. The AP names and configuration must still
-    match that baseline. Outside this window, a new CSA error is required.
+    any client attempts authentication. The AP names and configuration intent must
+    still match that baseline. The wireless fingerprint excludes only the known
+    numeric firmware status fields for current channels, the last automatic-channel
+    scan time and station counts; those can change when the relay resumes or clients
+    join. All other wireless fields, including credentials and unknown options,
+    remain protected, and the other configuration files are compared in full.
+    Outside this window, a new CSA error is required.
     Recovery disables all intended active APs before enabling any. For each band
     with a frequency mismatch, it temporarily sets hostapd's runtime channel to
     that AP's verified primary channel from before the stop, limited to an

@@ -5,6 +5,7 @@
 //! are unchanged. A healthy upstream does not prove hotspot clients can associate.
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -875,6 +876,11 @@ impl Backend for Native {
         for path in paths {
             remaining(deadline, self.now())?;
             let data = read_small(&path, LIMIT)?;
+            let data = if path == Path::new("/etc/config/wireless") {
+                canonical_wireless(&data)?
+            } else {
+                data
+            };
             hash.update(path.as_os_str().as_encoded_bytes());
             hash.update((data.len() as u64).to_le_bytes());
             hash.update(data);
@@ -923,6 +929,249 @@ impl Backend for Native {
         }
         Ok(())
     }
+}
+
+enum IntentValue<'a> {
+    Option(&'a str),
+    List(Vec<&'a str>),
+}
+
+struct IntentSection<'a> {
+    kind: &'a str,
+    name: Option<&'a str>,
+    options: BTreeMap<&'a str, IntentValue<'a>>,
+}
+
+fn wireless_parse_error() -> String {
+    "Cannot safely fingerprint Wi-Fi configuration".into()
+}
+
+fn finish_uci_token<'a>(
+    text: &'a str,
+    end: usize,
+    start: &mut Option<usize>,
+    tokens: &mut Vec<&'a str>,
+) -> Result<(), String> {
+    if let Some(begin) = start.take() {
+        if tokens.len() >= 3 {
+            return Err(wireless_parse_error());
+        }
+        tokens.push(&text[begin..end]);
+    }
+    Ok(())
+}
+
+// Split UCI statements without interpreting value escapes. Retaining value
+// tokens exactly makes unfamiliar quoting conservative instead of hiding changes.
+fn uci_statements(text: &str) -> Result<Vec<Vec<&str>>, String> {
+    let mut statements = Vec::new();
+    let mut tokens = Vec::new();
+    let mut start = None;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut comment = false;
+    for (index, byte) in text.bytes().enumerate() {
+        if comment {
+            if byte != b'\n' {
+                continue;
+            }
+            comment = false;
+        } else if escaped {
+            escaped = false;
+            continue;
+        } else if let Some(delimiter) = quote {
+            if byte == delimiter {
+                quote = None;
+            } else if delimiter == b'"' && byte == b'\\' {
+                escaped = true;
+            }
+            continue;
+        } else {
+            match byte {
+                b'\'' | b'"' => {
+                    start.get_or_insert(index);
+                    quote = Some(byte);
+                    continue;
+                }
+                b'\\' => {
+                    start.get_or_insert(index);
+                    escaped = true;
+                    continue;
+                }
+                b'#' if start.is_none() => {
+                    comment = true;
+                    continue;
+                }
+                b' ' | b'\t' | b'\r' => {
+                    finish_uci_token(text, index, &mut start, &mut tokens)?;
+                    continue;
+                }
+                b'\n' => {}
+                0 => return Err(wireless_parse_error()),
+                _ => {
+                    start.get_or_insert(index);
+                    continue;
+                }
+            }
+        }
+        finish_uci_token(text, index, &mut start, &mut tokens)?;
+        if !tokens.is_empty() {
+            if tokens.len() > 3 || statements.len() >= 16384 {
+                return Err(wireless_parse_error());
+            }
+            statements.push(std::mem::take(&mut tokens));
+        }
+    }
+    if quote.is_some() || escaped {
+        return Err(wireless_parse_error());
+    }
+    finish_uci_token(text, text.len(), &mut start, &mut tokens)?;
+    if !tokens.is_empty() {
+        if tokens.len() > 3 || statements.len() >= 16384 {
+            return Err(wireless_parse_error());
+        }
+        statements.push(tokens);
+    }
+    Ok(statements)
+}
+
+fn plain_uci_token(token: &str) -> &str {
+    if token.len() >= 2
+        && ((token.starts_with('\'') && token.ends_with('\''))
+            || (token.starts_with('"') && token.ends_with('"')))
+    {
+        &token[1..token.len() - 1]
+    } else {
+        token
+    }
+}
+
+fn uci_identifier(token: &str) -> Result<&str, String> {
+    let token = plain_uci_token(token);
+    if token.is_empty()
+        || !token.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'@' | b'[' | b']')
+        })
+    {
+        return Err(wireless_parse_error());
+    }
+    Ok(token)
+}
+
+fn runtime_status_option(section: &str, option: &str, value: &str) -> bool {
+    let known = matches!(
+        (section, option),
+        ("wifi0", "current_channel")
+            | ("wifi1", "current_channel")
+            | ("wifi0", "last_acs_time")
+            | ("main_2g", "sta_num")
+            | ("main_5g", "sta_num")
+            | ("guest_2g", "sta_num")
+            | ("guest_5g", "sta_num")
+            | ("config", "sta_num")
+    );
+    let value = plain_uci_token(value);
+    known && !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn canonical_wireless(data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.len() > LIMIT || data.contains(&0) {
+        return Err(wireless_parse_error());
+    }
+    let text = std::str::from_utf8(data).map_err(|_| wireless_parse_error())?;
+    let mut sections: Vec<IntentSection<'_>> = Vec::new();
+    let mut names = HashSet::new();
+    let mut package_seen = false;
+    for fields in uci_statements(text)? {
+        match fields.as_slice() {
+            ["package", name]
+                if !package_seen && sections.is_empty() && uci_identifier(name)? == "wireless" =>
+            {
+                package_seen = true;
+            }
+            ["config", kind] | ["config", kind, _] => {
+                let kind = uci_identifier(kind)?;
+                let name = fields.get(2).map(|name| uci_identifier(name)).transpose()?;
+                if name.is_some_and(|name| !names.insert(name)) {
+                    return Err(wireless_parse_error());
+                }
+                sections.push(IntentSection {
+                    kind,
+                    name,
+                    options: BTreeMap::new(),
+                });
+            }
+            [command @ ("option" | "list"), key, value] => {
+                let section = sections.last_mut().ok_or_else(wireless_parse_error)?;
+                let key = uci_identifier(key)?;
+                if *command == "option" {
+                    if section
+                        .options
+                        .insert(key, IntentValue::Option(value))
+                        .is_some()
+                    {
+                        return Err(wireless_parse_error());
+                    }
+                } else {
+                    match section
+                        .options
+                        .entry(key)
+                        .or_insert_with(|| IntentValue::List(Vec::new()))
+                    {
+                        IntentValue::List(values) => values.push(value),
+                        IntentValue::Option(_) => return Err(wireless_parse_error()),
+                    }
+                }
+            }
+            _ => return Err(wireless_parse_error()),
+        }
+    }
+    if sections.is_empty() {
+        return Err(wireless_parse_error());
+    }
+    let mut canonical = b"wireless-intent-v1\0".to_vec();
+    let append = |out: &mut Vec<u8>, value: &[u8]| {
+        out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        out.extend_from_slice(value);
+    };
+    for section in sections {
+        canonical.push(b'S');
+        append(&mut canonical, section.kind.as_bytes());
+        match section.name {
+            Some(name) => {
+                canonical.push(1);
+                append(&mut canonical, name.as_bytes());
+            }
+            None => canonical.push(0),
+        }
+        for (key, value) in section.options {
+            if let IntentValue::Option(value) = &value {
+                if section
+                    .name
+                    .is_some_and(|name| runtime_status_option(name, key, value))
+                {
+                    continue;
+                }
+            }
+            canonical.push(b'K');
+            append(&mut canonical, key.as_bytes());
+            match value {
+                IntentValue::Option(value) => {
+                    canonical.push(b'O');
+                    append(&mut canonical, value.as_bytes());
+                }
+                IntentValue::List(values) => {
+                    canonical.push(b'L');
+                    canonical.extend_from_slice(&(values.len() as u64).to_le_bytes());
+                    for value in values {
+                        append(&mut canonical, value.as_bytes());
+                    }
+                }
+            }
+        }
+        canonical.push(b'E');
+    }
+    Ok(canonical)
 }
 
 fn configured_channel(config: &str) -> Result<u16, String> {
@@ -2059,6 +2308,162 @@ mod tests {
             raw_value("ssid[0]= name \nstate=ENABLED\n", "ssid[0]"),
             Some(" name ")
         );
+    }
+
+    #[test]
+    fn numeric_runtime_fields_can_change_appear_and_disappear_without_changing_intent() {
+        let sections = [
+            ("wifi0", vec!["current_channel", "last_acs_time"]),
+            ("wifi1", vec!["current_channel"]),
+            ("main_2g", vec!["sta_num"]),
+            ("main_5g", vec!["sta_num"]),
+            ("guest_2g", vec!["sta_num"]),
+            ("guest_5g", vec!["sta_num"]),
+            ("config", vec!["sta_num"]),
+        ];
+        let base = sections
+            .iter()
+            .map(|(name, _)| format!("config section '{name}'\n option enabled '1'\n"))
+            .collect::<String>();
+        let expected = canonical_wireless(base.as_bytes()).unwrap();
+        for scalar in ["0", "'20250104001725'", "\"48\""] {
+            let with_status = sections
+                .iter()
+                .map(|(name, keys)| {
+                    format!(
+                        "config section '{name}'\n{} option enabled '1'\n",
+                        keys.iter()
+                            .map(|key| format!(" option '{key}' {scalar}\n"))
+                            .collect::<String>()
+                    )
+                })
+                .collect::<String>();
+            assert_eq!(
+                canonical_wireless(with_status.as_bytes()).unwrap(),
+                expected
+            );
+        }
+        let partial = base.replace(
+            "config section 'main_5g'\n",
+            "config section 'main_5g'\n option sta_num '2'\n",
+        );
+        assert_eq!(canonical_wireless(partial.as_bytes()).unwrap(), expected);
+    }
+
+    #[test]
+    fn all_saved_wireless_intent_and_unknown_status_fields_remain_protected() {
+        let fixture = "config wifi-device 'wifi0'\n option channel '0'\n option disabled '0'\n\
+            config wifi-device 'wifi1'\n option last_acs_time '10'\n\
+            config wifi-iface 'main_5g'\n option ssid 'test network'\n option key 'synthetic-passphrase'\n\
+            option encryption 'psk2+ccmp'\n option ieee80211w '0'\n option sta_num_extra '0'\n\
+            config settings 'zte_mbb'\n option wifi_onoff '1'\n\
+            config section 'other'\n option sta_num '0'\n";
+        let expected = canonical_wireless(fixture.as_bytes()).unwrap();
+        for (before, after) in [
+            ("channel '0'", "channel '40'"),
+            ("disabled '0'", "disabled '1'"),
+            ("last_acs_time '10'", "last_acs_time '11'"),
+            ("ssid 'test network'", "ssid 'test network 2'"),
+            ("key 'synthetic-passphrase'", "key 'other-passphrase'"),
+            ("encryption 'psk2+ccmp'", "encryption 'sae'"),
+            ("ieee80211w '0'", "ieee80211w '2'"),
+            ("sta_num_extra '0'", "sta_num_extra '1'"),
+            ("wifi_onoff '1'", "wifi_onoff '0'"),
+            ("sta_num '0'", "sta_num '1'"),
+        ] {
+            assert_ne!(
+                canonical_wireless(fixture.replace(before, after).as_bytes()).unwrap(),
+                expected,
+                "saved or unknown field was excluded"
+            );
+        }
+    }
+
+    #[test]
+    fn only_plain_decimal_scalar_status_values_are_excluded() {
+        let base = "config wifi-device wifi0\n";
+        let expected = canonical_wireless(base.as_bytes()).unwrap();
+        for value in [
+            "''", "'-1'", "'+1'", "'1 2'", "'1.0'", "'auto'", "'١'", "'4'\"0\"", "\\40",
+        ] {
+            let text = format!("{base} option current_channel {value}\n");
+            assert_ne!(canonical_wireless(text.as_bytes()).unwrap(), expected);
+        }
+        let list = format!("{base} list current_channel '40'\n");
+        assert_ne!(canonical_wireless(list.as_bytes()).unwrap(), expected);
+        let first = format!("{base} option current_channel 'auto'\n");
+        let second = format!("{base} option current_channel 'unknown'\n");
+        assert_ne!(
+            canonical_wireless(first.as_bytes()).unwrap(),
+            canonical_wireless(second.as_bytes()).unwrap()
+        );
+    }
+
+    #[test]
+    fn canonical_intent_preserves_sections_list_order_and_value_bytes() {
+        let first = "config wifi-iface main_2g\n option ssid 'synthetic'\n list peers 'a'\n list peers 'b'\n";
+        let second = "config wifi-iface main_5g\n option ssid 'synthetic 5'\n";
+        let fixture = format!("{first}{second}");
+        let expected = canonical_wireless(fixture.as_bytes()).unwrap();
+        let reordered_options = format!(
+            "# comment\n config 'wifi-iface' 'main_2g'\n\
+            list peers 'a' # comment\n list peers 'b'\n\toption ssid 'synthetic'\n{second}"
+        );
+        assert_eq!(
+            canonical_wireless(reordered_options.as_bytes()).unwrap(),
+            expected
+        );
+        for changed in [
+            format!("{second}{first}"),
+            fixture.replace(
+                "list peers 'a'\n list peers 'b'",
+                "list peers 'b'\n list peers 'a'",
+            ),
+            fixture.replace("list peers 'a'\n list peers 'b'", "option peers 'a b'"),
+            fixture.replace("'synthetic'", "' synthetic '"),
+            fixture.replace("'synthetic'", "'合成'"),
+            fixture.replace("main_2g", "main_2g_renamed"),
+        ] {
+            assert_ne!(canonical_wireless(changed.as_bytes()).unwrap(), expected);
+        }
+        let scalar = "config wifi-iface main_2g\n option peers 'a'\n";
+        assert_ne!(
+            canonical_wireless(scalar.as_bytes()).unwrap(),
+            canonical_wireless(scalar.replace("option peers", "list peers").as_bytes()).unwrap()
+        );
+        let quoted =
+            "config wifi-device wifi0\n option key 'first\n option current_channel 40\nlast'\n";
+        assert_ne!(
+            canonical_wireless(quoted.as_bytes()).unwrap(),
+            canonical_wireless(quoted.replace("40", "48").as_bytes()).unwrap()
+        );
+        let escaped = "config wifi-iface main_5g\n option key 'synthetic'\\''quote'\n";
+        assert_ne!(
+            canonical_wireless(escaped.as_bytes()).unwrap(),
+            canonical_wireless(escaped.replace("quote", "other").as_bytes()).unwrap()
+        );
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_wireless_intent_fails_closed() {
+        for text in [
+            "",
+            "option key 'value'\n",
+            "config wifi-iface main_2g\n option ssid\n",
+            "config wifi-iface main_2g\n option key 'unterminated\n",
+            "config wifi-iface main_2g\n option key trailing\\",
+            "config wifi-iface main_2g\n option ssid 'a'\n option ssid 'b'\n",
+            "config wifi-iface main_2g\n option ssid 'a'\n list ssid 'b'\n",
+            "config wifi-iface main_2g\n list ssid 'a'\n option ssid 'b'\n",
+            "config wifi-iface main_2g\n config wifi-iface main_2g\n",
+            "config wifi-iface main_2g\n arbitrary command 'value'\n",
+            "config wifi-iface main_2g\n option key 'embedded\0nul'\n",
+            "config wifi-iface main_2g\n option key value extra\n",
+        ] {
+            assert!(canonical_wireless(text.as_bytes()).is_err());
+        }
+        assert!(canonical_wireless(&[0xff]).is_err());
+        assert!(canonical_wireless(&vec![b' '; LIMIT + 1]).is_err());
     }
 
     #[test]
