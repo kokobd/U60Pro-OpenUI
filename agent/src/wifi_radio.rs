@@ -138,9 +138,59 @@ pub struct Monitor {
     post_change: Option<PostChange>,
     attempted: bool,
     failure: Option<String>,
+    diagnostic_once: u8,
+    candidate_diagnostics: u8,
 }
 
 impl Monitor {
+    fn revoke_window(&mut self, reason: &'static str) {
+        if self.post_change.take().is_some() {
+            eprintln!("wifi-radio: window-revoked reason={reason}");
+        }
+    }
+
+    fn window_diagnostic_once(&mut self, bit: u8, event: &'static str) {
+        if self.post_change.is_some() && self.diagnostic_once & bit == 0 {
+            self.diagnostic_once |= bit;
+            eprintln!("wifi-radio: {event}");
+        }
+    }
+
+    fn candidate_diagnostic(&mut self, event: &'static str, sample: Option<&Sample>) {
+        if self.post_change.is_none() || self.candidate_diagnostics >= 8 {
+            return;
+        }
+        self.candidate_diagnostics += 1;
+        if let Some(sample) = sample {
+            let aps: Vec<_> = sample
+                .aps
+                .iter()
+                .enumerate()
+                .map(|(index, ap)| {
+                    format!(
+                        "ap{index}:intended={},enabled={},host={:?},driver={:?},ssid_match={:?}",
+                        ap.intended,
+                        ap.state == "ENABLED",
+                        ap.host_frequency,
+                        ap.driver_frequency,
+                        ap.ssid_matches
+                    )
+                })
+                .collect();
+            eprintln!(
+                "wifi-radio: mismatch-candidate {event} stock_known={} idle={} {}",
+                sample.stock_known,
+                sample.idle,
+                aps.join(" ")
+            );
+        } else {
+            eprintln!("wifi-radio: mismatch-candidate {event}");
+        }
+        if self.candidate_diagnostics == 8 {
+            eprintln!("wifi-radio: mismatch-candidate diagnostics capped for this window");
+        }
+    }
+
     /// Call under the radio-operation lock after a settings hold is released and
     /// before the first resumed relay step. A verified ready configuration gets
     /// a short settling window; this does not reset the recovery/error latch.
@@ -149,8 +199,10 @@ impl Monitor {
     }
 
     fn after_hotspot_change_with(&mut self, backend: &mut impl Backend) -> Result<(), String> {
-        self.post_change = None;
+        self.revoke_window("rearmed");
         self.pending = None;
+        self.diagnostic_once = 0;
+        self.candidate_diagnostics = 0;
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
@@ -174,6 +226,12 @@ impl Monitor {
             interfaces,
             fingerprint,
         });
+        eprintln!(
+            "wifi-radio: window-armed seconds=120 intended_aps={}",
+            self.post_change
+                .as_ref()
+                .map_or(0, |window| window.interfaces.len())
+        );
         Ok(())
     }
 
@@ -181,11 +239,18 @@ impl Monitor {
         let Some(window) = &self.post_change else {
             return false;
         };
-        if backend.now() >= window.until
-            || backend.fingerprint(&window.interfaces, deadline).ok() != Some(window.fingerprint)
-            || backend.now() >= window.until
-        {
-            self.post_change = None;
+        let reason = if backend.now() >= window.until {
+            Some("expired")
+        } else {
+            match backend.fingerprint(&window.interfaces, deadline) {
+                Err(_) => Some("fingerprint-read-failed"),
+                Ok(current) if current != window.fingerprint => Some("fingerprint-changed"),
+                Ok(_) if backend.now() >= window.until => Some("expired"),
+                Ok(_) => None,
+            }
+        };
+        if let Some(reason) = reason {
+            self.revoke_window(reason);
             return false;
         }
         true
@@ -199,6 +264,9 @@ impl Monitor {
     }
 
     fn baseline_with(&mut self, backend: &mut impl Backend) {
+        if self.pending.is_some() {
+            self.candidate_diagnostic("reset-baseline", None);
+        }
         self.pending = None;
         match backend.evidence(backend.now() + SAMPLE_TIMEOUT) {
             Ok(evidence) => {
@@ -229,6 +297,10 @@ impl Monitor {
         let evidence = match backend.evidence(deadline) {
             Ok(value) => value,
             Err(_) => {
+                self.window_diagnostic_once(1, "evidence-read-failed during-window");
+                if self.pending.is_some() {
+                    self.candidate_diagnostic("reset-evidence-read-failed", None);
+                }
                 self.pending = None;
                 return Ok(None);
             }
@@ -247,6 +319,10 @@ impl Monitor {
                     .is_some_and(|event| event > previous)
             });
         if rebooted || log_restarted {
+            self.window_diagnostic_once(4, "evidence-clock-restarted during-window");
+            if self.pending.is_some() {
+                self.candidate_diagnostic("reset-evidence-clock", None);
+            }
             self.pending = None;
         }
         // Kernel printk timestamps and uptime can treat suspend differently.
@@ -255,31 +331,61 @@ impl Monitor {
         self.last_uptime_us = Some(evidence.uptime_us);
         let sample = match backend.sample(deadline) {
             Ok(value) if value.mismatched() => value,
-            _ => {
+            Ok(value) => {
+                if !value.stock_known {
+                    self.window_diagnostic_once(16, "stock-status-unreadable during-window");
+                } else if !value.idle {
+                    self.window_diagnostic_once(32, "stock-service-busy during-window");
+                } else if !value.ready() {
+                    self.window_diagnostic_once(64, "ap-runtime-not-ready during-window");
+                }
+                if self.pending.is_some() {
+                    self.candidate_diagnostic("reset-no-longer-mismatched", Some(&value));
+                }
+                self.pending = None;
+                return Ok(None);
+            }
+            Err(_) => {
+                self.window_diagnostic_once(2, "sample-read-failed during-window");
+                if self.pending.is_some() {
+                    self.candidate_diagnostic("reset-sample-read-failed", None);
+                }
                 self.pending = None;
                 return Ok(None);
             }
         };
         let now = backend.now();
-        match &mut self.pending {
-            Some(pending) if pending.sample == sample => pending.fresh_error |= fresh,
-            _ => {
-                self.pending = Some(Pending {
-                    since: now,
-                    sample: sample.clone(),
-                    fresh_error: fresh,
-                });
-                return Ok(None);
-            }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.sample == sample)
+        {
+            self.pending.as_mut().unwrap().fresh_error |= fresh;
+        } else {
+            self.candidate_diagnostic(
+                if self.pending.is_some() {
+                    "reset-sample-changed"
+                } else {
+                    "start"
+                },
+                Some(&sample),
+            );
+            self.pending = Some(Pending {
+                since: now,
+                sample: sample.clone(),
+                fresh_error: fresh,
+            });
+            return Ok(None);
         }
         let pending = self.pending.as_ref().unwrap();
         let fresh_error = pending.fresh_error;
+        let stable_since = pending.since;
         if self
             .post_change
             .as_ref()
             .is_some_and(|window| now >= window.until)
         {
-            self.post_change = None;
+            self.revoke_window("expired-during-sample");
         }
         let post_change = post_change
             && self.post_change.is_some()
@@ -287,10 +393,11 @@ impl Monitor {
                 .aps
                 .iter()
                 .all(|ap| !ap.intended || ap.ssid_matches == Some(true));
-        if now.duration_since(pending.since) < STABLE_MISMATCH || !(fresh_error || post_change) {
+        if now.duration_since(stable_since) < STABLE_MISMATCH || !(fresh_error || post_change) {
             return Ok(None);
         }
         if self.attempted {
+            eprintln!("wifi-radio: recovery-recurrence-latched");
             return self.fail("The Wi-Fi channel fault returned after one recovery; automatic recovery is stopped");
         }
         let interfaces: Vec<_> = sample
@@ -309,6 +416,8 @@ impl Monitor {
         let before = match backend.fingerprint(&interfaces, deadline) {
             Ok(value) => value,
             Err(_) => {
+                self.window_diagnostic_once(8, "recovery-fingerprint-read-failed during-window");
+                self.candidate_diagnostic("reset-preflight-fingerprint", None);
                 self.pending = None;
                 return Ok(None);
             }
@@ -335,14 +444,22 @@ impl Monitor {
         match backend.sample(deadline) {
             Ok(current) if current == sample => {}
             _ => {
+                self.candidate_diagnostic("reset-preflight-sample-changed-or-unreadable", None);
                 self.pending = None;
                 return Ok(None);
             }
         }
-        if backend.fingerprint(&interfaces, deadline).ok() != Some(before) {
-            self.pending = None;
-            self.post_change = None;
-            return Ok(None);
+        match backend.fingerprint(&interfaces, deadline) {
+            Ok(current) if current == before => {}
+            result => {
+                self.pending = None;
+                self.revoke_window(if result.is_err() {
+                    "preflight-fingerprint-read-failed"
+                } else {
+                    "preflight-fingerprint-changed"
+                });
+                return Ok(None);
+            }
         }
         // The settling window grants permission only for the captured settings,
         // including immediately before the first mutation. A fresh CSA error
@@ -353,14 +470,27 @@ impl Monitor {
                 .as_ref()
                 .is_some_and(|window| window.fingerprint == before);
         if !fresh_error && !window_still_matches {
+            self.candidate_diagnostic("reset-window-no-longer-authorizes", None);
             self.pending = None;
             return Ok(None);
         }
         self.attempted = true;
         self.pending = None;
+        eprintln!(
+            "wifi-radio: recovery-attempt trigger={} active_aps={} channel_changes={}",
+            if fresh_error {
+                "fresh-csa"
+            } else {
+                "post-change-window"
+            },
+            interfaces.len(),
+            channels.len()
+        );
         if let Err(error) = recover(backend, &interfaces, &channels, before) {
+            eprintln!("wifi-radio: recovery-failed");
             return self.fail(&error);
         }
+        eprintln!("wifi-radio: recovery-succeeded");
         Ok(Some(
             "Recovered the Wi-Fi channel-switch stall; saved settings are unchanged".into(),
         ))

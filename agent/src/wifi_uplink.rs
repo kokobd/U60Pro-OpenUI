@@ -1925,6 +1925,7 @@ pub fn hold_for_hotspot_change() -> Result<wifi_maintenance::Hold<'static>, Stri
     let ticket = wifi_maintenance::pending()
         .ok_or("The Wi-Fi maintenance request ended before relay resume was recorded")?;
     HOTSPOT_RESUME.store(ticket, Ordering::Release);
+    eprintln!("[wifi-radio] event=hold_ack_recorded ticket={ticket}");
     Ok(hold)
 }
 
@@ -1940,9 +1941,12 @@ fn try_radio_operation<'a>(
     };
     // Hold release wakes us before the caller drops the operation lock. Consume
     // its acknowledgement only after acquiring the lock, and only for that hold.
-    let after_change = held_ticket
-        .take()
-        .is_some_and(|ticket| acknowledged.swap(0, Ordering::AcqRel) == ticket);
+    let after_change = held_ticket.take().is_some_and(|ticket| {
+        let acknowledged_ticket = acknowledged.swap(0, Ordering::AcqRel);
+        let matched = acknowledged_ticket == ticket;
+        eprintln!("[wifi-radio] event=resume_consumed ticket={ticket} acknowledged_ticket={acknowledged_ticket} matched={matched}");
+        matched
+    });
     Some((guard, after_change))
 }
 
@@ -2008,6 +2012,7 @@ pub fn start() {
                     // Establish the ready baseline before the resumed STA can
                     // move channels. Failed verification keeps ordinary policy.
                     if after_change && radio_monitor.after_hotspot_change().is_err() {
+                        eprintln!("[wifi-radio] event=post_change_arm_failed reason=readiness_or_configuration_unverified");
                         log_line("uplink: post-change recovery was not armed because AP readiness or configuration could not be verified");
                     }
                     match load() {
