@@ -5,15 +5,11 @@
 //! is not evidence that hotspot clients can associate.
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::fs::{self, DirBuilder, File};
+use std::fs::{self, File};
 use std::io::Read;
-use std::os::unix::{
-    fs::{DirBuilderExt, FileTypeExt, MetadataExt},
-    net::UnixDatagram,
-};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const STABLE_MISMATCH: Duration = Duration::from_secs(15);
@@ -23,7 +19,6 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(300);
 const LIMIT: usize = 2 * 1024 * 1024;
 const CTRL: &str = "/data/vendor/wifi/hostapd";
-static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Ap {
@@ -804,64 +799,30 @@ fn kernel_timestamp(line: &str) -> Option<u64> {
     decimal_us(timestamp.trim())
 }
 
-struct SocketPath {
-    directory: PathBuf,
-    socket: PathBuf,
-}
-impl Drop for SocketPath {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.socket);
-        let _ = fs::remove_dir(&self.directory);
-    }
-}
-
 fn hostapd(iface: &str, command: &str, deadline: Instant) -> Result<String, String> {
-    if !valid_iface(iface) || !matches!(command, "STATUS" | "DISABLE" | "ENABLE") {
+    if !valid_iface(iface) {
         return Err("Invalid hotspot control request".into());
     }
-    let deadline = deadline.min(Instant::now() + COMMAND_TIMEOUT);
-    let directory = PathBuf::from(format!(
-        "/tmp/openui-radio-{}-{}",
-        std::process::id(),
-        NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
-    ));
-    DirBuilder::new()
-        .mode(0o700)
-        .create(&directory)
-        .map_err(|_| "Cannot create hotspot control socket")?;
-    let paths = SocketPath {
-        socket: directory.join("ctrl"),
-        directory,
+    let command = match command {
+        "STATUS" => "status",
+        "DISABLE" => "disable",
+        "ENABLE" => "enable",
+        _ => return Err("Invalid hotspot control request".into()),
     };
-    let socket =
-        UnixDatagram::bind(&paths.socket).map_err(|_| "Cannot create hotspot control socket")?;
-    socket
-        .set_write_timeout(Some(remaining(deadline, Instant::now())?))
-        .map_err(|_| "Cannot configure hotspot control socket")?;
-    socket
-        .connect(Path::new(CTRL).join(iface))
-        .map_err(|_| "Hotspot control socket is unavailable")?;
-    socket
-        .send(command.as_bytes())
-        .map_err(|_| "Hotspot control request failed")?;
-    let mut buffer = [0u8; 16384];
-    loop {
-        socket
-            .set_read_timeout(Some(remaining(deadline, Instant::now())?))
-            .map_err(|_| "Cannot configure hotspot control socket")?;
-        let count = socket
-            .recv(&mut buffer)
-            .map_err(|_| "Hotspot did not answer the control request")?;
-        if count == buffer.len() {
-            return Err("Hotspot control reply exceeded the read limit".into());
-        }
-        let reply =
-            std::str::from_utf8(&buffer[..count]).map_err(|_| "Invalid hotspot control reply")?;
-        if reply.starts_with('<') {
-            continue;
-        }
-        return Ok(reply.to_string());
+    // The firmware client creates a reply socket accessible to the unprivileged
+    // hostapd daemon; a root-only client socket directory prevents its replies.
+    let timeout = COMMAND_TIMEOUT.min(remaining(deadline, Instant::now())?);
+    let reply = process_runner::output(
+        Command::new("hostapd_cli").args(["-p", CTRL, "-i", iface, command]),
+        None,
+        timeout,
+        16384,
+    )
+    .map_err(|_| "Hotspot control request failed")?;
+    if !reply.status.success() {
+        return Err("Hotspot control request failed".into());
     }
+    String::from_utf8(reply.stdout).map_err(|_| "Invalid hotspot control reply".into())
 }
 
 #[cfg(test)]
